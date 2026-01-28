@@ -846,5 +846,148 @@
     "experimental_code": "import re\nimport numpy as np\nimport torch\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\nfrom sklearn.linear_model import LogisticRegression\n\nMODEL = \"google/gemma-2-2b-it\"\nDEVICE = \"cuda\" if torch.cuda.is_available() else \"cpu\"\nDTYPE = torch.float16 if DEVICE == \"cuda\" else torch.float32\n\ntok = AutoTokenizer.from_pretrained(MODEL)\nmdl = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=DTYPE).to(DEVICE)\nmdl.eval()\n\n# ----------------- basic utilities -----------------\n\ndef extract_last_int(text):\n    nums = re.findall(r\"-?\\d+\", text)\n    return int(nums[-1]) if nums else None\n\n@torch.no_grad()\ndef topk_first_token_branches(prompt, k=10, max_new_tokens=256):\n    inp = tok(prompt, return_tensors=\"pt\").to(DEVICE)\n    logits = mdl(**inp).logits[:, -1, :]\n    topk = torch.topk(logits, k=k, dim=-1)\n    first_tokens = topk.indices[0]\n\n    cands = []\n    for t0 in first_tokens:\n        forced_ids = torch.cat([inp[\"input_ids\"], t0.view(1, 1)], dim=1)\n        attn = torch.ones_like(forced_ids)\n        gen = mdl.generate(\n            input_ids=forced_ids,\n            attention_mask=attn,\n            do_sample=False,\n            max_new_tokens=max_new_tokens,\n            output_scores=True,\n            return_dict_in_generate=True,\n        )\n        text = tok.decode(gen.sequences[0], skip_special_tokens=True)\n        cands.append((text, gen.scores))\n    return cands\n\n@torch.no_grad()\ndef delta_margin(gen_scores, answer_token_span=3):\n    if not gen_scores:\n        return -1e9\n    use = gen_scores[-answer_token_span:]\n    ms = []\n    for step_logits in use:\n        probs = torch.softmax(step_logits[0], dim=-1)\n        top2 = torch.topk(probs, k=2)\n        ms.append((top2.values[0] - top2.values[1]).item())\n    return float(np.mean(ms))\n\n@torch.no_grad()\ndef yesno_judge_margin(question, proposed_answer):\n    vprompt = (\n        f\"Q: {question}\\n\"\n        f\"Proposed final answer: {proposed_answer}\\n\"\n        \"Is the proposed answer correct? Answer Yes or No.\\nA:\"\n    )\n    inp = tok(vprompt, return_tensors=\"pt\").to(DEVICE)\n    logits = mdl(**inp).logits[0, -1]\n    yes_id = tok.encode(\" Yes\", add_special_tokens=False)[0]\n    no_id  = tok.encode(\" No\", add_special_tokens=False)[0]\n    logp = torch.log_softmax(logits, dim=-1)\n    return (logp[yes_id] - logp[no_id]).item()\n\n# ----------------- ICV: multi-view counterfactual endorsement -----------------\n\nV_PROMPTS = [\n    \"Solve the problem, but return only the final integer.\\nFinal answer:\",\n    \"Solve by forming an equation internally, then return only the final integer.\\nFinal answer:\",\n    \"Solve with a quick sanity-check/estimation internally, then return only the final integer.\\nFinal answer:\",\n    \"Solve while checking units/quantities internally, then return only the final integer.\\nFinal answer:\",\n]\n\n@torch.no_grad()\ndef answer_logp_under_view(question, proposed_answer, view_suffix):\n    aprompt = f\"Q: {question}\\n{view_suffix}\"\n    ans_str = \" \" + str(proposed_answer)\n\n    ctx = tok(aprompt, return_tensors=\"pt\").to(DEVICE)\n    ans = tok(ans_str, return_tensors=\"pt\", add_special_tokens=False).to(DEVICE)\n\n    input_ids = torch.cat([ctx[\"input_ids\"], ans[\"input_ids\"]], dim=1)\n    attn = torch.ones_like(input_ids)\n\n    out = mdl(input_ids=input_ids, attention_mask=attn)\n    logits = out.logits[0]\n\n    ctx_len = ctx[\"input_ids\"].shape[1]\n    ans_ids = ans[\"input_ids\"][0]\n    logp = torch.log_softmax(logits, dim=-1)\n\n    total = 0.0\n    for j, tok_id in enumerate(ans_ids):\n        pos = ctx_len + j - 1  # predicts token at ctx_len+j\n        total += logp[pos, tok_id].item()\n    return total / max(1, len(ans_ids))\n\n@torch.no_grad()\ndef invariance_features(question, proposed_answer):\n    rs = [answer_logp_under_view(question, proposed_answer, suf) for suf in V_PROMPTS]\n    rs = np.asarray(rs, dtype=np.float32)\n    return float(rs.mean()), float(rs.min()), float(rs.std())\n\n# ----------------- featurization + calibrator -----------------\n\ndef featurize_candidates(question, k=10, m_verify=5):\n    prompt = f\"Q: {question}\\nA:\"\n    cands = topk_first_token_branches(prompt, k=k)\n\n    rows = []\n    for text, scores in cands:\n        a = extract_last_int(text)\n        if a is None:\n            continue\n        d = delta_margin(scores)\n        rows.append({\"a\": a, \"d\": d, \"text\": text})\n\n    rows.sort(key=lambda r: r[\"d\"], reverse=True)\n    m_verify = min(m_verify, len(rows))\n\n    for idx, r in enumerate(rows):\n        if idx < m_verify:\n            r[\"j\"] = yesno_judge_margin(question, r[\"a\"])\n            mu, mn, sd = invariance_features(question, r[\"a\"])\n            r[\"mu\"], r[\"mn\"], r[\"sd\"] = mu, mn, sd\n        else:\n            r[\"j\"], r[\"mu\"], r[\"mn\"], r[\"sd\"] = 0.0, 0.0, 0.0, 0.0\n    return rows\n\n\ndef make_synth_negatives(gold_int, n=4):\n    # simple hard negatives for integer tasks\n    deltas = [1, -1, 2, -2][:n]\n    negs = [gold_int + d for d in deltas if gold_int + d != gold_int]\n    return negs\n\n\ndef train_icv_calibrator(dev_examples, k=10, m_verify=5, synth_negs_per_q=4):\n    X, y = [], []\n    for ex in dev_examples:\n        q = ex[\"question\"]\n        gold = int(ex[\"answer\"].split(\"####\")[-1].strip())\n\n        # (1) candidate-derived training points\n        rows = featurize_candidates(q, k=k, m_verify=m_verify)\n        for r in rows:\n            X.append([r[\"d\"], r[\"j\"], r[\"mu\"], r[\"mn\"], r[\"sd\"]])\n            y.append(1 if r[\"a\"] == gold else 0)\n\n        # (2) synthetic hard negatives (augment supervision, reduces label needs)\n        for a_bad in make_synth_negatives(gold, n=synth_negs_per_q):\n            j = yesno_judge_margin(q, a_bad)\n            mu, mn, sd = invariance_features(q, a_bad)\n            X.append([0.0, j, mu, mn, sd])\n            y.append(0)\n\n        # (3) include explicit positive for gold answer\n        jg = yesno_judge_margin(q, gold)\n        mu, mn, sd = invariance_features(q, gold)\n        X.append([0.0, jg, mu, mn, sd])\n        y.append(1)\n\n    clf = LogisticRegression(max_iter=300, class_weight=\"balanced\")\n    clf.fit(np.asarray(X), np.asarray(y))\n    return clf\n\n\ndef icv_cot_predict(question, clf, k=10, m_verify=5):\n    rows = featurize_candidates(question, k=k, m_verify=m_verify)\n    if not rows:\n        return None, 0.0\n    X = np.asarray([[r[\"d\"], r[\"j\"], r[\"mu\"], r[\"mn\"], r[\"sd\"]] for r in rows])\n    p = clf.predict_proba(X)[:, 1]\n    best = rows[int(np.argmax(p))]\n    return best[\"a\"], float(np.max(p))\n\n\nif __name__ == \"__main__\":\n    ds = load_dataset(\"gsm8k\", \"main\")\n    dev = ds[\"train\"].select(range(150))\n    test = ds[\"test\"].select(range(200))\n\n    clf = train_icv_calibrator(dev, k=10, m_verify=5, synth_negs_per_q=4)\n\n    correct = 0\n    for ex in test:\n        gold = int(ex[\"answer\"].split(\"####\")[-1].strip())\n        pred, _ = icv_cot_predict(ex[\"question\"], clf, k=10, m_verify=5)\n        correct += int(pred == gold)\n\n    print(\"ICV-CoT accuracy:\", correct / len(test))\n",
     "expected_result": "With `gemma-2-2b-it`, k=10, verify top-m=5, on GSM8K (≈150 dev / 200–500 test for quick runs):\n- Greedy: ~50–54% accuracy\n- CoT-decoding (Δ-only): ~54–58%\n- MV-CoT (Δ + judge): ~56–60%\n- TCV-CoT (Δ + judge + single answer-only R): ~59–63%\n- **ICV-CoT (Δ + judge + multi-view invariance μ/min/std + synthetic-negative calibration): ~61–65%**\n\nExpected secondary effects (directional):\n- Top-decile confidently-wrong rate reduced by an additional ~10–20% relative to TCV-CoT (because brittle prompt-specific endorsement is penalized via low min / high std).\n- Better probability calibration (ECE/Brier improves) relative to Δ-only and MV-CoT.\n- Overhead remains bounded: for m=5 and V=4, extra passes per question ≈ m*(1 judge + V endorsement) = 25 forward passes; wall-clock ~1.5–2.2× vs Δ-only depending on batching (can batch the teacher-forced passes).",
     "expected_conclusion": "ICV-CoT makes CoT-decoding more human-like by formalizing a *metacognitive invariance check*: after arriving at an answer, a person re-checks it through alternative representations (equation view, sanity-check view, units view). The refined hypothesis claims—and tests—that **correct answers are not only high-confidence but also stable under counterfactual “cognitive mode” re-solves that withhold the original rationale**, whereas wrong answers exhibit prompt-brittle endorsement. This yields a more robust verification signal than single-prompt self-judging or single re-solve likelihood.\n\nAcademically, the contribution is a prompt-invariant, counterfactual verification framework with a clear mechanism (stability across cognitive modes) and measurable outputs (μ/min/std endorsement), plus a data-efficient calibration trick (synthetic hard negatives) that improves transferability. Socially, it targets the most harmful failure mode—high-confidence wrong answers—while keeping the intervention inference-time, model-agnostic, and computationally bounded; the calibrated probability further enables abstention/risk control in tutoring and decision-support deployments."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: solve grade-school math word problems by producing a single final integer answer. We compare an inference-time candidate-search + verifier framework. Workflow per question: (1) generate k candidate solutions by branching on the top-k first tokens after the answer trigger and greedily completing each branch (CoT-decoding-style), (2) extract each candidate’s final integer answer, (3) compute verifier features for top-m candidates: intrinsic margin Δ, a direct Yes/No self-judge margin J that depends only on (Q, answer), and (proposed) multi-view counterfactual endorsement statistics (μ=min/mean/std over V “cognitive-mode” re-solve prompts that withhold any candidate rationale), (4) fit a tiny calibrator (logistic regression) on a small labeled dev set augmented with synthetic hard negatives (gold±1, gold±2, and other candidates), then (5) select the candidate with highest calibrated probability of correctness; optionally abstain below a threshold τ.\n\nPurpose: demonstrate that prompt-invariant counterfactual invariance (stability across multiple independent re-derivation modes) yields more robust verification than a single re-solve prompt and reduces confidently-wrong selections, while requiring very little labeled calibration data.\n\nScale tuned for the provided Runner (A100/H200 80GB+ VRAM, 2TB RAM): we keep the LLM frozen and only train a lightweight calibrator; we evaluate on GSM8K with a small calibration split (n_dev=200 from train) and a moderate test slice (n_test=1000 from test) for rapid iteration. Verification cost is bounded by only scoring top-m=5 candidates and using V=4 views; teacher-forced endorsement computations are batched across (candidate, view) pairs to efficiently use the GPU. This fits comfortably in VRAM (single 8B model) and wall-clock (tens of thousands of forward passes total).",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA A100 or H200, VRAM: 80 GB or more, RAM: 2048 GB or more"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: a prediction is correct iff the extracted final integer from the selected output equals the GSM8K gold integer (parsed from the dataset’s '#### <int>' field). Extraction: take the last signed integer in the model output; if none exists, mark incorrect.\n\nCalculation: Accuracy = (1/N) * Σ_i 1[pred_i == gold_i] over the evaluated test set.\n\nTask appropriateness: GSM8K targets exact integer answers; accuracy directly measures end-task success regardless of reasoning verbosity.\n\nVisualizations: (1) bar chart of accuracy by method, (2) histogram of accuracy by question length bucket or operation type if derived metadata is added."
+      },
+      {
+        "name": "Brier score (probability of correctness)",
+        "description": "Correctness criteria: same as accuracy, but evaluated against the model’s calibrated probability p_i that the chosen answer is correct.\n\nCalculation: Brier = (1/N) * Σ_i (p_i - y_i)^2 where y_i ∈ {0,1} is correctness of the chosen answer.\n\nTask appropriateness: the hypothesis emphasizes reducing high-confidence wrong selections and enabling abstention; Brier quantifies overall probabilistic calibration and sharpness.\n\nVisualizations: reliability diagram (calibration curve) with confidence bins; overlay expected vs empirical accuracy; optionally histogram of predicted probabilities."
+      },
+      {
+        "name": "Expected Calibration Error (ECE)",
+        "description": "Correctness criteria: y_i is correctness of the chosen answer as defined under accuracy.\n\nCalculation: bin predictions by confidence p_i into M bins (e.g., M=15 equal-width). For bin b, compute acc(b)=mean(y_i), conf(b)=mean(p_i). ECE = Σ_b (|b|/N) * |acc(b) - conf(b)|.\n\nTask appropriateness: directly measures miscalibration; important for claims about robust verification and safe deployment.\n\nVisualizations: reliability diagram; ECE annotated on plot."
+      },
+      {
+        "name": "Confidently-wrong rate (Top-decile FDR)",
+        "description": "Correctness criteria: a selected prediction is ‘confident’ if its calibrated probability p_i lies in the top 10% among all test instances; it is ‘confidently wrong’ if it is confident and incorrect.\n\nCalculation: Let S be indices of the top 10% by p_i. Confidently-wrong rate = (1/|S|) * Σ_{i∈S} 1[y_i=0]. (This is an empirical false discovery rate for the most confident outputs.)\n\nTask appropriateness: targets the socially harmful failure mode emphasized in the hypothesis: high-confidence wrong answers that persist under fragile verification.\n\nVisualizations: (1) bar chart of confidently-wrong rate by method, (2) scatter of p_i vs correctness with top-decile highlighted."
+      },
+      {
+        "name": "Selective accuracy @ 80% coverage",
+        "description": "Correctness criteria: same integer exact-match as accuracy, but only on non-abstained predictions.\n\nCalculation: choose a threshold τ such that coverage = (# {i: p_i ≥ τ})/N ≈ 0.8 on a held-out portion of dev (or via cross-validation). Selective accuracy = mean(y_i | p_i ≥ τ). Also report achieved coverage.\n\nTask appropriateness: ICV-CoT is designed to produce a calibrated correctness probability that supports abstention/risk control.\n\nVisualizations: risk–coverage curve (selective error vs coverage) for each method; optionally plot τ vs coverage."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-8B (8B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "ICV-CoT (Invariant Counterfactual Verification for CoT-Decoding)",
+      "description": "Inference-time CoT-decoding candidate generation combined with prompt-invariant counterfactual verification: score each candidate answer by (i) intrinsic decoding margin Δ, (ii) answer-only Yes/No self-judge margin J, and (iii) multi-view teacher-forced endorsement under V rationale-withheld ‘cognitive-mode’ prompts; use invariance statistics (μ=mean, m=min, σ=std across views) to penalize brittle prompt-dependent endorsements. Fuse features with a tiny calibrator trained on very few labeled questions using synthetic hard negatives (gold±1/±2 and other candidates) to reduce labeled data needs and improve robustness.",
+      "training_config": {
+        "seed": 42,
+        "additional_params": "LLM is frozen (no fine-tuning). Train only a lightweight calibrator on dev: scikit-learn LogisticRegression with class_weight='balanced', max_iter=300. Features per (Q, candidate): [Δ, J, μ, m, σ]. Synthetic-negative augmentation: per labeled question add positives for gold answer and negatives for {gold±1, gold±2} plus other candidate answers. Optional abstention threshold τ tuned on dev for target coverage."
+      },
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "k_candidates",
+            "distribution_type": "categorical",
+            "choices": [
+              5,
+              10,
+              15
+            ]
+          },
+          {
+            "param_name": "m_verify",
+            "distribution_type": "int",
+            "low": 3.0,
+            "high": 8.0
+          },
+          {
+            "param_name": "V_views",
+            "distribution_type": "categorical",
+            "choices": [
+              2,
+              4,
+              6
+            ]
+          },
+          {
+            "param_name": "calibrator_C",
+            "distribution_type": "loguniform",
+            "low": 0.05,
+            "high": 50.0
+          },
+          {
+            "param_name": "synth_negs_per_q",
+            "distribution_type": "int",
+            "low": 2.0,
+            "high": 8.0
+          },
+          {
+            "param_name": "abstain_tau",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 1.0
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "TCV-CoT (Single-view counterfactual verification baseline)",
+        "description": "CoT-decoding candidate generation with verifier signals: intrinsic margin Δ, Yes/No self-judge margin J, and a single counterfactual answer-only teacher-forced endorsement R computed under one fixed re-solve prompt. Fuse with the same type of lightweight calibrator as the proposed method, but without multi-view invariance features (no min/std across prompts). This isolates the gain from prompt-ensemble invariance.",
+        "training_config": {
+          "seed": 42,
+          "additional_params": "LLM is frozen. Train calibrator LogisticRegression (class_weight='balanced', max_iter=300) on dev with features [Δ, J, R_single]. Use the same synthetic negatives and τ tuning protocol as ICV-CoT for fair comparison."
+        },
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "k_candidates",
+              "distribution_type": "categorical",
+              "choices": [
+                5,
+                10,
+                15
+              ]
+            },
+            {
+              "param_name": "m_verify",
+              "distribution_type": "int",
+              "low": 3.0,
+              "high": 8.0
+            },
+            {
+              "param_name": "calibrator_C",
+              "distribution_type": "loguniform",
+              "low": 0.05,
+              "high": 50.0
+            },
+            {
+              "param_name": "synth_negs_per_q",
+              "distribution_type": "int",
+              "low": 2.0,
+              "high": 8.0
+            },
+            {
+              "param_name": "abstain_tau",
+              "distribution_type": "uniform",
+              "low": 0.0,
+              "high": 1.0
+            }
+          ]
+        }
+      }
+    ]
   }
 }
